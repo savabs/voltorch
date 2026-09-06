@@ -14,6 +14,36 @@ spot, the strike, the maturity **and** the model parameters. So:
 pip install voltorch
 ```
 
+
+## 0.2: arbitrage-free surfaces from a live chain
+
+```python
+from voltorch import fit_chain
+from voltorch.deribit import fetch_chain      # no key; Deribit public API
+
+report = fit_chain(fetch_chain("BTC"), currency="BTC")
+report.refined["rmse_vol_pts"], report.refined["inside_bid_ask_share"]
+report.venue_violations["executable"]          # butterflies/verticals/calendars you could trade
+report.our_violations                           # must be zero; Durrleman g and calendar Δw
+report.greeks_max_abs_err                       # autograd vs closed-form Black-76
+```
+
+Live, refit every 30 minutes: **https://savabs.github.io/voltorch/**
+
+* `ESSVI` — extended SSVI (Hendriks–Martini 2019): per-expiry (θ, ρ, ψ) with the
+  butterfly and calendar conditions enforced by the parameterisation, so the
+  surface is arbitrage-free *by construction* at every optimiser step.
+* `SVISlice` — per-expiry raw SVI refinement, arbitrage-*checked* on a dense grid
+  (Durrleman g ≥ 0, calendar against neighbours) with fallback to the backbone.
+* `arbitrage` — `durrleman_g`, `butterfly_violations`, `vertical_violations`,
+  `calendar_violations`, and `executable_violations` (against bids and asks).
+* `implied_volatility_bisect` — bracketed bisection for market quotes; it cannot
+  stall where Newton does (a documented Deribit case is in the tests).
+* `deribit.fetch_chain` — coin prices convert to USD on the *forward*
+  (`price × F = Black-76`), verified against the venue's marks to 1e-4.
+
+Install: `pip install "voltorch[page]"` for the loader and the page renderer.
+
 ## Greeks, without finite differences
 
 ```python

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "voltorch"
-version = "0.1.0"
+version = "0.2.0"
 description = "Differentiable option pricing and volatility surfaces in PyTorch"
 readme = "README.md"
 requires-python = ">=3.10"

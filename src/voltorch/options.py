@@ -860,3 +860,41 @@ class VarianceGammaCOS(FourierCOS):
         c1 = (r - q) * T + self.theta * T
         c2 = sigma**2 * T + self.theta**2 * nu * T
         return c1, c2
+
+
+def implied_volatility_bisect(
+    S: torch.Tensor,
+    K: torch.Tensor,
+    T: torch.Tensor,
+    r: torch.Tensor,
+    market_price: torch.Tensor,
+    q: Optional[torch.Tensor] = None,
+    is_call: bool | torch.Tensor = True,
+    lo: float = 1e-4,
+    hi: float = 10.0,
+    iters: int = 64,
+) -> torch.Tensor:
+    """Bracketed bisection on sigma. Not differentiable and 3x slower than
+    Newton, but it cannot fail: price is monotone in sigma, so 64 halvings of
+    [lo, hi] pin sigma to 1e-18 relative for any quote inside the no-arbitrage
+    bounds. Use this for market quotes; use ``implied_volatility`` (Newton)
+    when you need gradients through the inversion.
+
+    Symptom this replaces: fixed-iteration Newton from a Brenner-Subrahmanyam
+    start stalls where vega ~ 0 and returns ~0.06 for a quote whose true vol
+    is 0.39 (Deribit BTC-25SEP26-73000-P, 2026-09-06). Prices below intrinsic
+    return ``lo``; prices above the upper bound return ``hi``.
+    """
+    bs = BlackScholes()
+    with torch.no_grad():
+        a = torch.full_like(market_price, lo, dtype=torch.float64)
+        b = torch.full_like(market_price, hi, dtype=torch.float64)
+        S, K, T, r, P = (x.to(torch.float64) for x in (S, K, T, r, market_price))
+        q64 = None if q is None else q.to(torch.float64)
+        for _ in range(iters):
+            mid = 0.5 * (a + b)
+            pm = bs(S, K, T, r, mid, q64, is_call=is_call)
+            too_high = pm > P
+            b = torch.where(too_high, mid, b)
+            a = torch.where(too_high, a, mid)
+        return 0.5 * (a + b)

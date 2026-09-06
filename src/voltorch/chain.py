@@ -21,9 +21,9 @@ import numpy as np
 import pandas as pd
 import torch
 
-from .arbitrage import butterfly_violations, calendar_violations, durrleman_g, vertical_violations
+from .arbitrage import butterfly_violations, calendar_violations, durrleman_g, executable_violations, vertical_violations
 from .options import BlackScholes
-from .ssvi import SSVI
+from .ssvi import ESSVI
 
 _N = torch.distributions.Normal(0.0, 1.0)
 
@@ -85,7 +85,7 @@ def fit_chain(df: pd.DataFrame, *, currency: str = "", device: str = "cpu", as_o
     # -- fit -----------------------------------------------------------------
     theta0 = torch.tensor([float((q[q["T"] == t].assign(a=lambda d: d.k.abs()).nsmallest(3, "a")["mid_iv"] ** 2).mean() * t)
                            for t in expiries], dtype=torch.float64)
-    model = SSVI(torch.tensor(expiries, dtype=torch.float64), theta_init=theta0, rho=-0.1, eta=0.8, gamma=0.5)
+    model = ESSVI(torch.tensor(expiries, dtype=torch.float64), theta_init=theta0)
     if device != "cpu":
         model = model.to(torch.float32).to(device)
     k = torch.tensor(q["k"].values); T = torch.tensor(q["T"].values); iv = torch.tensor(q["mid_iv"].values)
@@ -119,13 +119,19 @@ def fit_chain(df: pd.DataFrame, *, currency: str = "", device: str = "cpu", as_o
         for v in vertical_violations(s["strike"].values, mark_c, 1.0, tol):
             venue["vertical"].append({"T": float(t), **v})
         cal_slices.append((float(t), s["k"].values, (s["mark_iv"].values ** 2) * float(t)))
-        slices_out.append({"T": float(t), "forward": F, "k": s["k"].round(4).tolist(),
+        err = (s["fit_iv"] - s["mid_iv"]) * 100
+        slices_out.append({"T": float(t), "forward": F, "n": int(len(s)),
+                           "rmse_vol_pts": float(np.sqrt((err ** 2).mean())),
+                           "inside_bid_ask": float(((s["fit_iv"] >= s["bid_iv"]) & (s["fit_iv"] <= s["ask_iv"])).mean()),
+                           "k": s["k"].round(4).tolist(),
                            "strike": s["strike"].tolist(), "bid_iv": s["bid_iv"].round(4).tolist(),
                            "ask_iv": s["ask_iv"].round(4).tolist(), "mark_iv": s["mark_iv"].round(4).tolist(),
                            "fit_iv": s["fit_iv"].round(4).tolist()})
     # calendar tolerance: spread in total-variance units, per slice
     cal_tol = [float(((s["spread"] * s["mid_iv"] * 2 * s["T"]).median())) for t in expiries for s in [q[q["T"] == t]]]
     venue["calendar"] = calendar_violations(cal_slices, cal_tol)
+    # the one that matters: arbitrage you could trade against the bids and asks
+    venue["executable"] = executable_violations(df[df["two_sided"]])
 
     # -- our surface: must be clean -----------------------------------------
     grid = torch.linspace(-2.0, 2.0, 400, dtype=torch.float64)
@@ -134,7 +140,8 @@ def fit_chain(df: pd.DataFrame, *, currency: str = "", device: str = "cpu", as_o
         ws = torch.stack([model.total_variance(grid, torch.full_like(grid, float(t))) for t in expiries])
         cal_min = float(torch.diff(ws, dim=0).min()) if len(expiries) > 1 else 0.0
     ours = {"durrleman_min_g": g_min, "butterfly_violations": int(g_min < -1e-9),
-            "calendar_min_dw": cal_min, "calendar_violations": int(cal_min < -1e-12)}
+            "calendar_min_dw": cal_min, "calendar_violations": int(cal_min < -1e-12),
+            "conditions_hold": bool(fit["conditions"])}
 
     # -- greeks: autograd vs closed form -------------------------------------
     F = torch.tensor(q["forward"].values, requires_grad=True); K = torch.tensor(q["strike"].values)
@@ -146,8 +153,8 @@ def fit_chain(df: pd.DataFrame, *, currency: str = "", device: str = "cpu", as_o
     vega = torch.autograd.grad(price.sum(), sig, retain_graph=True)[0]
     theta = -torch.autograd.grad(price.sum(), T)[0]
     d, g, v, th = _black76_greeks_closed_form(F.detach(), K, T.detach(), sig.detach(), ic)
-    greeks = {"delta": float((delta - d).abs().max()), "gamma": float((gamma - g).abs().max()),
-              "vega": float((vega - v).abs().max()), "theta": float((theta - th).abs().max())}
+    greeks = {"delta": float((delta - d).abs().max().detach()), "gamma": float((gamma - g).abs().max().detach()),
+              "vega": float((vega - v).abs().max().detach()), "theta": float((theta - th).abs().max().detach())}
 
     return FitReport(
         currency=currency, as_of=as_of, n_quotes=int(len(df)), n_two_sided=int(df["two_sided"].sum()),

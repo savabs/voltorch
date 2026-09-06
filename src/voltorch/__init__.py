@@ -23,6 +23,7 @@ from .options import (
     MertonCOS,
     VarianceGammaCOS,
     implied_volatility,
+    implied_volatility_bisect,
 )
 from .volatility import (
     SVIParameterization,
@@ -37,7 +38,7 @@ from .arbitrage import butterfly_violations, calendar_violations, durrleman_g, v
 __version__ = "0.1.0"
 
 __all__ = [
-    "SSVI", "fit_chain", "FitReport", "otm", "butterfly_violations", "calendar_violations", "durrleman_g", "vertical_violations",
+    "implied_volatility_bisect", "SSVI", "fit_chain", "FitReport", "otm", "butterfly_violations", "calendar_violations", "durrleman_g", "vertical_violations",
     "BlackScholes",
     "BaroneAdesiWhaley",
     "FourierCOS",

@@ -17,7 +17,7 @@ import pandas as pd
 import requests
 import torch
 
-from .options import implied_volatility
+from .options import implied_volatility_bisect
 
 API = "https://www.deribit.com/api/v2/public"
 UA = "voltorch (github.com/savabs/voltorch)"
@@ -79,7 +79,7 @@ def fetch_chain(currency: str = "BTC", *, session: requests.Session | None = Non
             for is_call in (True, False):
                 cm = torch.tensor(df.loc[m, "is_call"].values == is_call)
                 if cm.any():
-                    iv = implied_volatility(F[cm], K[cm], T[cm], r[cm], P[cm], is_call=is_call, max_iters=40)
+                    iv = implied_volatility_bisect(F[cm], K[cm], T[cm], r[cm], P[cm], is_call=is_call)
                     ivs[cm.numpy()] = iv.detach().numpy()
             df.loc[m, col] = ivs
     return df[COLUMNS].sort_values(["expiry", "strike", "is_call"]).reset_index(drop=True)

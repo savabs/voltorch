@@ -59,3 +59,26 @@ def test_runs_on_mps_if_available():
     m32 = m.to(torch.float32).to("mps")
     out = m32.total_variance(torch.linspace(-0.5, 0.5, 5, device="mps"), torch.full((5,), 0.3, device="mps"))
     assert torch.isfinite(out).all()
+
+
+def test_essvi_recovers_per_slice_skew_and_stays_arbitrage_free():
+    from voltorch.ssvi import ESSVI
+    T = torch.tensor([0.02, 0.1, 0.3, 0.8], dtype=torch.float64)
+    truth = ESSVI(T, theta_init=torch.tensor([0.004, 0.02, 0.06, 0.15], dtype=torch.float64),
+                  psi_init=torch.tensor([0.05, 0.10, 0.16, 0.25], dtype=torch.float64))
+    with torch.no_grad():
+        truth.raw_rho.copy_(torch.tensor([-0.6, -0.2, 0.3, 0.5]))   # skew that changes sign across expiries
+    assert truth.satisfies_conditions()
+    ks = torch.linspace(-0.5, 0.5, 31, dtype=torch.float64)
+    k = ks.repeat(len(T)); Tt = T.repeat_interleave(len(ks))
+    with torch.no_grad():
+        iv = truth.implied_vol(k, Tt)
+    m = ESSVI(T)
+    rep = m.fit(k, Tt, iv, adam_steps=400, lbfgs_steps=100)
+    assert rep["rmse_vol_pts"] < 0.05, rep
+    assert rep["conditions"]
+    grid = torch.linspace(-1.5, 1.5, 200, dtype=torch.float64)
+    for t in T:
+        assert (durrleman_g(grid, lambda kk: m.total_variance(kk, t.expand_as(kk))) >= -1e-9).all()
+    ws = torch.stack([m.total_variance(grid, t.expand_as(grid)) for t in T])
+    assert (torch.diff(ws, dim=0) >= -1e-12).all()

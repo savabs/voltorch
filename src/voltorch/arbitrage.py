@@ -93,3 +93,52 @@ def calendar_violations(slices: list[tuple[float, np.ndarray, np.ndarray]],
             out.append({"T_earlier": float(T0), "T_later": float(T1), "k": float(kk),
                         "magnitude": float(mm), "tolerance": float(tols[i])})
     return out
+
+
+def executable_violations(df, *, min_edge_usd: float = 0.0) -> dict:
+    """Arbitrage you could actually trade against the book, in USD per unit.
+
+    ``df`` rows: expiry, T, strike, is_call, forward, bid_usd, ask_usd (two-sided
+    only). Prices are undiscounted (r = 0). Puts are mapped to calls via
+    put-call parity on the same forward: C = P + F - K.
+
+      butterfly  buy lam1 of K- and lam2 of K+ at the ask, sell 1 of K at the bid;
+                 payoff >= 0, so a negative cost is free money
+      vertical   buy K at ask, sell K+ at bid: cost < 0 is free money;
+                 sell K at bid, buy K+ at ask: credit > (K+ - K) is free money
+      calendar   same strike, buy the later expiry at ask, sell the earlier at bid:
+                 cost < 0 is free money (r = 0, martingale forward)
+
+    Only edges above ``min_edge_usd`` are reported.
+    """
+    import pandas as pd
+    q = df[df["two_sided"]].copy()
+    q["bid_c"] = q["bid_usd"] + (~q["is_call"]) * (q["forward"] - q["strike"])
+    q["ask_c"] = q["ask_usd"] + (~q["is_call"]) * (q["forward"] - q["strike"])
+    # at each (expiry, strike) keep the tightest synthetic call: highest bid, lowest ask
+    g = q.groupby(["T", "strike"]).agg(bid_c=("bid_c", "max"), ask_c=("ask_c", "min"), forward=("forward", "median")).reset_index()
+    out = {"butterfly": [], "vertical": [], "calendar": []}
+    for t, s in g.groupby("T"):
+        s = s.sort_values("strike").reset_index(drop=True)
+        K, B, A = s["strike"].values, s["bid_c"].values, s["ask_c"].values
+        for i in range(1, len(K) - 1):
+            lam = (K[i] - K[i - 1]) / (K[i + 1] - K[i - 1])
+            cost = (1 - lam) * A[i - 1] + lam * A[i + 1] - B[i]
+            if cost < -min_edge_usd:
+                out["butterfly"].append({"T": float(t), "strikes": (float(K[i - 1]), float(K[i]), float(K[i + 1])), "edge_usd": float(-cost)})
+        for i in range(len(K) - 1):
+            c1 = A[i] - B[i + 1]
+            if c1 < -min_edge_usd:
+                out["vertical"].append({"T": float(t), "strikes": (float(K[i]), float(K[i + 1])), "kind": "buy_spread_for_credit", "edge_usd": float(-c1)})
+            c2 = B[i] - A[i + 1] - (K[i + 1] - K[i])
+            if c2 > min_edge_usd:
+                out["vertical"].append({"T": float(t), "strikes": (float(K[i]), float(K[i + 1])), "kind": "credit_exceeds_width", "edge_usd": float(c2)})
+    Ts = sorted(g["T"].unique())
+    by_T = {t: g[g["T"] == t].set_index("strike") for t in Ts}
+    for t0, t1 in zip(Ts, Ts[1:]):
+        common = by_T[t0].index.intersection(by_T[t1].index)
+        for K in common:
+            cost = by_T[t1].loc[K, "ask_c"] - by_T[t0].loc[K, "bid_c"]
+            if cost < -min_edge_usd:
+                out["calendar"].append({"T_earlier": float(t0), "T_later": float(t1), "strike": float(K), "edge_usd": float(-cost)})
+    return out

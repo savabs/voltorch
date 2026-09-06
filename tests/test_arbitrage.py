@@ -37,3 +37,24 @@ def test_calendar_violation_detected():
     bad = calendar_violations([(0.25, k, w2), (0.5, k, w1)])
     assert len(bad) == 21 and all(b["magnitude"] > 0 for b in bad)
     assert calendar_violations([(0.25, k, w2), (0.5, k, w1)], tol=1.0) == []
+
+
+def test_executable_violations_on_a_book():
+    import pandas as pd
+    from voltorch.arbitrage import executable_violations
+    F = 100.0
+    rows = []
+    for K, mid in ((90, 12.0), (100, 5.0), (110, 1.5)):
+        rows.append(dict(expiry="a", T=0.5, strike=K, is_call=True, forward=F, bid_usd=mid - 0.2, ask_usd=mid + 0.2, two_sided=True))
+    df = pd.DataFrame(rows)
+    assert all(len(v) == 0 for v in executable_violations(df).values())
+    df.loc[df.strike == 100, "bid_usd"] = 8.0          # body bid absurdly high: sell body, buy wings for a credit
+    v = executable_violations(df)
+    assert len(v["butterfly"]) == 1 and v["butterfly"][0]["edge_usd"] > 0
+    # calendar: later expiry offered below the earlier bid at the same strike
+    later = df.copy(); later["expiry"] = "b"; later["T"] = 1.0; later[["bid_usd", "ask_usd"]] = [[3.0, 3.4]] * 3
+    later.loc[later.strike == 100, ["bid_usd", "ask_usd"]] = [4.0, 4.5]
+    both = pd.concat([df, later])
+    both.loc[both.strike == 100, "bid_usd"] = [5.0 - 0.2, 4.0]
+    v2 = executable_violations(both)
+    assert any(c["strike"] == 90 for c in v2["calendar"])   # 90-strike later ask 3.4 < earlier bid 11.8

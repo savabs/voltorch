@@ -1,10 +1,16 @@
 """Deribit public chain loader. No key. Layer 1: fetch and normalise only.
 
 Deribit options are inverse (coin-settled): prices are quoted in BTC/ETH per
-contract, strikes in USD, interest_rate 0. We convert bid/ask to USD with the
-index price and back out implied vols with our own Black-76 solver on the
-per-expiry forward (``underlying_price``), so the bid/ask IVs on the page are
-ours, not the venue's -- and ``mark_iv`` is theirs, kept for comparison.
+contract, strikes in USD, interest_rate 0. The convention, verified against
+the venue's own marks to 1e-4 relative on 2026-09-06:
+
+    price_in_coin * F  ==  Black76(F, K, T, sigma)   with F = ``underlying_price``
+
+i.e. USD value on the *forward*, not on spot. Using spot (the index) is off
+by the basis -- 3.7% at 292 days -- and silently biases every implied vol
+and every parity relation. We convert with F and back out bid/ask implied
+vols with our own bisection solver; ``mark_iv`` is the venue's, kept for
+comparison.
 """
 
 from __future__ import annotations
@@ -21,7 +27,7 @@ from .options import implied_volatility_bisect
 
 API = "https://www.deribit.com/api/v2/public"
 UA = "voltorch (github.com/savabs/voltorch)"
-COLUMNS = ["instrument", "expiry", "T", "strike", "is_call", "forward", "index_price",
+COLUMNS = ["instrument", "expiry", "T", "strike", "is_call", "forward",
            "mark_iv", "bid", "ask", "bid_usd", "ask_usd", "bid_iv", "ask_iv", "two_sided",
            "open_interest", "volume"]
 
@@ -49,12 +55,10 @@ def fetch_chain(currency: str = "BTC", *, session: requests.Session | None = Non
         T = (exp - now).total_seconds() / (365.0 * 86400)
         if T * 365 < min_T_days:
             continue
-        idx = b.get("index_price") or b.get("estimated_delivery_price") or np.nan
         bid, ask = b.get("bid_price"), b.get("ask_price")
         rows.append({
             "instrument": b["instrument_name"], "expiry": exp, "T": T, "strike": float(i["strike"]),
             "is_call": i["option_type"] == "call", "forward": float(b["underlying_price"]),
-            "index_price": float(idx) if idx else np.nan,
             "mark_iv": (b.get("mark_iv") or np.nan) / 100.0,
             "bid": bid if bid is not None else np.nan, "ask": ask if ask is not None else np.nan,
             "open_interest": b.get("open_interest") or 0.0, "volume": b.get("volume") or 0.0,
@@ -62,9 +66,9 @@ def fetch_chain(currency: str = "BTC", *, session: requests.Session | None = Non
     df = pd.DataFrame(rows)
     if df.empty:
         return pd.DataFrame(columns=COLUMNS)
-    # inverse contract: price in coin * index = USD price of the option
-    df["bid_usd"] = df["bid"] * df["index_price"]
-    df["ask_usd"] = df["ask"] * df["index_price"]
+    # inverse contract: price in coin * forward = undiscounted USD price on the forward
+    df["bid_usd"] = df["bid"] * df["forward"]
+    df["ask_usd"] = df["ask"] * df["forward"]
     df["two_sided"] = df["bid"].notna() & df["ask"].notna() & (df["bid"] > 0) & (df["ask"] > 0)
     df["bid_iv"], df["ask_iv"] = np.nan, np.nan
     m = df["two_sided"].values

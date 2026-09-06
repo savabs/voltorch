@@ -30,10 +30,14 @@ from .volatility import (
     ImpliedVolatilitySurface,
 )
 from .rough import RoughBergomiModel, estimate_hurst_exponent
+from .ssvi import SSVI
+from .chain import FitReport, fit_chain, otm
+from .arbitrage import butterfly_violations, calendar_violations, durrleman_g, vertical_violations
 
 __version__ = "0.1.0"
 
 __all__ = [
+    "SSVI", "fit_chain", "FitReport", "otm", "butterfly_violations", "calendar_violations", "durrleman_g", "vertical_violations",
     "BlackScholes",
     "BaroneAdesiWhaley",
     "FourierCOS",

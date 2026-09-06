@@ -33,6 +33,9 @@ chain = ["requests>=2.31", "pandas>=2.0"]
 page = ["requests>=2.31", "pandas>=2.0", "matplotlib>=3.8"]
 dev = ["pytest>=7.0"]
 
+[tool.hatch.build.targets.sdist]
+only-include = ["src/voltorch", "README.md", "LICENSE", "pyproject.toml"]
+
 [project.urls]
 Homepage = "https://github.com/savabs/voltorch"
 Issues = "https://github.com/savabs/voltorch/issues"

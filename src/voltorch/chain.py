@@ -115,8 +115,13 @@ def fit_chain(df: pd.DataFrame, *, currency: str = "", device: str = "cpu", as_o
         pen_grid = torch.linspace(-2.0 * span, 2.0 * span, 80, dtype=torch.float64)
         chk_lo, chk_hi = max(-2.0, -3.0 * span), min(2.0, 3.0 * span)
         chk_grid = torch.linspace(chk_lo, chk_hi, 300, dtype=torch.float64)
-        sl = SVISlice.from_backbone(model, float(t), warm_grid)
-        sl.fit(kk, ivt, ww, steps=600, lr=0.02, g_grid=pen_grid)
+        # two warm starts (backbone shape, quote moments); keep the better fit
+        cands = []
+        for sl in (SVISlice.from_backbone(model, float(t), warm_grid), SVISlice.from_quotes(float(t), kk, ivt)):
+            sl.fit(kk, ivt, ww, steps=600, lr=0.02, g_grid=pen_grid)
+            with torch.no_grad():
+                cands.append((float(((sl.implied_vol(kk) - ivt) ** 2 * ww).mean()), sl))
+        sl = min(cands, key=lambda c: c[0])[1]
         with torch.no_grad():
             wg = sl.total_variance(grid)
         g = durrleman_g(chk_grid, sl.total_variance)

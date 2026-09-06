@@ -339,6 +339,21 @@ class SVISlice(nn.Module):
         return torch.sqrt(self.variance(k))
 
     @classmethod
+    def from_quotes(cls, T: float, k: torch.Tensor, iv: torch.Tensor) -> "SVISlice":
+        """T-invariant warm start from the quotes: ATM level from the nearest
+        strikes, wing slopes from the ends, skew from their asymmetry."""
+        k = k.to(torch.float64); v = iv.to(torch.float64) ** 2
+        order = torch.argsort(k); k, v = k[order], v[order]
+        i0 = int(k.abs().argmin()); atm = float(v[i0])
+        n = max(2, len(k) // 4)
+        sl = float((v[-1] - v[-n]) / (k[-1] - k[-n] + 1e-9)); sr = sl
+        sl_ = float((v[n - 1] - v[0]) / (k[n - 1] - k[0] + 1e-9))
+        b = max((abs(sl) + abs(sl_)) / 2, 0.02)
+        rho = max(min((sl + sl_) / (2 * b), 0.9), -0.9)
+        span = float(max(k.abs().max(), 0.05))
+        return cls(T, a=max(atm * 0.7, 1e-6), b=b, rho=rho, m=0.0, s=0.3 * span)
+
+    @classmethod
     def from_backbone(cls, backbone, T: float, k_grid: torch.Tensor, steps: int = 300) -> "SVISlice":
         """Warm start: least-squares match to the backbone slice on the grid,
         so refinement begins from an arbitrage-free shape."""
@@ -352,14 +367,14 @@ class SVISlice(nn.Module):
         return sl
 
     def fit(self, k, iv_target, weights, steps: int = 400, lr: float = 0.01,
-            g_grid: torch.Tensor | None = None, penalty: float = 1.0) -> float:
+            g_grid: torch.Tensor | None = None, penalty: float = 1.0, lbfgs_steps: int = 100) -> float:
         """Weighted least squares in implied-vol space, plus a soft Durrleman
-        penalty on ``g_grid`` to keep the search inside the admissible set."""
+        penalty on ``g_grid`` to keep the search inside the admissible set.
+        Adam to get near, L-BFGS to finish -- without the finish, two slices
+        with the same annualised smile fit to different local optima."""
         iv_target = iv_target.to(torch.float64); weights = weights.to(torch.float64) / weights.mean()
-        opt = torch.optim.Adam(self.parameters(), lr=lr)
-        loss = torch.tensor(0.0)
-        for _ in range(steps):
-            opt.zero_grad()
+
+        def loss_fn():
             loss = (weights * (self.implied_vol(k) - iv_target) ** 2).mean()
             if g_grid is not None:
                 kk = g_grid.detach().requires_grad_(True)
@@ -368,5 +383,15 @@ class SVISlice(nn.Module):
                 w2 = torch.autograd.grad(w1.sum(), kk, create_graph=True)[0]
                 g = (1.0 - kk * w1 / (2.0 * w)) ** 2 - (w1 ** 2 / 4.0) * (1.0 / w + 0.25) + w2 / 2.0
                 loss = loss + penalty * torch.relu(-g).mean()
-            loss.backward(); opt.step()
-        return float(loss.detach())
+            return loss
+
+        opt = torch.optim.Adam(self.parameters(), lr=lr)
+        for _ in range(steps):
+            opt.zero_grad(); loss = loss_fn(); loss.backward(); opt.step()
+        if lbfgs_steps:
+            lb = torch.optim.LBFGS(self.parameters(), max_iter=lbfgs_steps, line_search_fn="strong_wolfe")
+
+            def closure():
+                lb.zero_grad(); loss = loss_fn(); loss.backward(); return loss
+            lb.step(closure)
+        return float(loss_fn().detach())

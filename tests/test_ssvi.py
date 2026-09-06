@@ -82,3 +82,18 @@ def test_essvi_recovers_per_slice_skew_and_stays_arbitrage_free():
         assert (durrleman_g(grid, lambda kk: m.total_variance(kk, t.expand_as(kk))) >= -1e-9).all()
     ws = torch.stack([m.total_variance(grid, t.expand_as(grid)) for t in T])
     assert (torch.diff(ws, dim=0) >= -1e-12).all()
+
+
+def test_svi_slice_scale_invariant_and_checked():
+    from voltorch.ssvi import ESSVI, SVISlice
+    # a 2-day and a 300-day slice with the same annualised smile must fit equally well
+    for T in (2 / 365, 300 / 365):
+        k = torch.linspace(-0.3, 0.3, 25, dtype=torch.float64)
+        iv = 0.5 + 0.3 * k ** 2 - 0.1 * k
+        bb = ESSVI(torch.tensor([T], dtype=torch.float64), theta_init=torch.tensor([0.25 * T], dtype=torch.float64))
+        sl = SVISlice.from_backbone(bb, T, torch.linspace(-0.45, 0.45, 80, dtype=torch.float64))
+        sl.fit(k, iv, torch.ones_like(iv), steps=600, lr=0.02, g_grid=torch.linspace(-0.6, 0.6, 50, dtype=torch.float64))
+        err = float(torch.sqrt(((sl.implied_vol(k) - iv) ** 2).mean()) * 100)
+        assert err < 0.2, (T, err)
+        g = durrleman_g(torch.linspace(-0.9, 0.9, 200, dtype=torch.float64), sl.total_variance)
+        assert (g >= -1e-9).all()

@@ -300,3 +300,73 @@ class ESSVI(nn.Module):
                     "conditions": self.satisfies_conditions(),
                     "rho": [float(x) for x in self.rho], "psi": [float(x) for x in self.psi],
                     "theta": [float(x) for x in self.theta]}
+
+
+class SVISlice(nn.Module):
+    """Raw SVI for one expiry, parameterised in *annualised* variance so that
+    a 2-day and a 300-day slice live on the same numeric scale:
+
+        w(k) = T * ( a + b * ( rho*(k-m) + sqrt((k-m)^2 + s^2) ) )
+
+    Five parameters against eSSVI's three; the extra freedom (m shifts the
+    smile, s sets ATM curvature independently of the wings) is what fits a
+    crypto smile to the spread. Nothing structural prevents arbitrage here,
+    so a refined slice is only accepted after Durrleman's g >= 0 holds on a
+    dense grid and the calendar check against its neighbours passes; a
+    rejected slice falls back to the eSSVI backbone and is labelled.
+    """
+
+    def __init__(self, T: float, a=0.04, b=0.3, rho=-0.1, m=0.0, s=0.2):
+        super().__init__()
+        self.T = float(T)
+        d = torch.float64
+        self.raw_a = nn.Parameter(torch.tensor(float(a), dtype=d))
+        self.raw_b = nn.Parameter(_inv_softplus(torch.tensor(float(b), dtype=d)))
+        self.raw_rho = nn.Parameter(torch.tensor(math.atanh(max(min(rho, 0.99), -0.99)), dtype=d))
+        self.raw_m = nn.Parameter(torch.tensor(float(m), dtype=d))
+        self.raw_s = nn.Parameter(_inv_softplus(torch.tensor(float(s), dtype=d)))
+
+    def variance(self, k: torch.Tensor) -> torch.Tensor:
+        k = k.to(torch.float64)
+        b, rho, s = nn.functional.softplus(self.raw_b), torch.tanh(self.raw_rho), nn.functional.softplus(self.raw_s)
+        km = k - self.raw_m
+        return (self.raw_a + b * (rho * km + torch.sqrt(km ** 2 + s ** 2))).clamp(min=1e-8)
+
+    def total_variance(self, k: torch.Tensor) -> torch.Tensor:
+        return self.T * self.variance(k)
+
+    def implied_vol(self, k: torch.Tensor) -> torch.Tensor:
+        return torch.sqrt(self.variance(k))
+
+    @classmethod
+    def from_backbone(cls, backbone, T: float, k_grid: torch.Tensor, steps: int = 300) -> "SVISlice":
+        """Warm start: least-squares match to the backbone slice on the grid,
+        so refinement begins from an arbitrage-free shape."""
+        with torch.no_grad():
+            v = backbone.total_variance(k_grid, torch.full_like(k_grid, T)) / T
+        atm = float(v[int(k_grid.abs().argmin())])
+        sl = cls(T, a=atm * 0.8, b=0.3 * math.sqrt(atm), rho=0.0, m=0.0, s=0.2)
+        opt = torch.optim.Adam(sl.parameters(), lr=0.02)
+        for _ in range(steps):
+            opt.zero_grad(); loss = ((sl.variance(k_grid) - v) ** 2).mean(); loss.backward(); opt.step()
+        return sl
+
+    def fit(self, k, iv_target, weights, steps: int = 400, lr: float = 0.01,
+            g_grid: torch.Tensor | None = None, penalty: float = 1.0) -> float:
+        """Weighted least squares in implied-vol space, plus a soft Durrleman
+        penalty on ``g_grid`` to keep the search inside the admissible set."""
+        iv_target = iv_target.to(torch.float64); weights = weights.to(torch.float64) / weights.mean()
+        opt = torch.optim.Adam(self.parameters(), lr=lr)
+        loss = torch.tensor(0.0)
+        for _ in range(steps):
+            opt.zero_grad()
+            loss = (weights * (self.implied_vol(k) - iv_target) ** 2).mean()
+            if g_grid is not None:
+                kk = g_grid.detach().requires_grad_(True)
+                w = self.total_variance(kk)
+                w1 = torch.autograd.grad(w.sum(), kk, create_graph=True)[0]
+                w2 = torch.autograd.grad(w1.sum(), kk, create_graph=True)[0]
+                g = (1.0 - kk * w1 / (2.0 * w)) ** 2 - (w1 ** 2 / 4.0) * (1.0 / w + 0.25) + w2 / 2.0
+                loss = loss + penalty * torch.relu(-g).mean()
+            loss.backward(); opt.step()
+        return float(loss.detach())

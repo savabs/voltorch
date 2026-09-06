@@ -23,7 +23,7 @@ import torch
 
 from .arbitrage import butterfly_violations, calendar_violations, durrleman_g, executable_violations, vertical_violations
 from .options import BlackScholes
-from .ssvi import ESSVI
+from .ssvi import ESSVI, SVISlice
 
 _N = torch.distributions.Normal(0.0, 1.0)
 
@@ -60,6 +60,7 @@ class FitReport:
     expiries: int
     fit: dict
     inside_bid_ask_share: float
+    refined: dict
     venue_violations: dict
     our_violations: dict
     greeks_max_abs_err: dict
@@ -99,6 +100,61 @@ def fit_chain(df: pd.DataFrame, *, currency: str = "", device: str = "cpu", as_o
     q["fit_iv"] = fitted
     inside = float(((fitted >= q["bid_iv"].values) & (fitted <= q["ask_iv"].values)).mean())
 
+    # -- refinement: per-slice SVI, arbitrage-CHECKED, backbone fallback ------
+    grid = torch.linspace(-2.0, 2.0, 400, dtype=torch.float64)
+    refined_w, refined_status, validated = {}, {}, {}
+    t_r = time.time()
+    for t in expiries:
+        s = q[q["T"] == t]
+        kk = torch.tensor(s["k"].values); ivt = torch.tensor(s["mid_iv"].values); ww = torch.tensor(1.0 / s["spread"].values ** 2)
+        # every grid is scaled to the slice's quoted range: a 2-day expiry has
+        # quotes inside |k| < 0.12 and astronomically large wings at |k| = 2,
+        # which would dominate any least squares or penalty evaluated there.
+        span = float(max(abs(s["k"].min()), abs(s["k"].max()), 0.05))
+        warm_grid = torch.linspace(-1.5 * span, 1.5 * span, 80, dtype=torch.float64)
+        pen_grid = torch.linspace(-2.0 * span, 2.0 * span, 80, dtype=torch.float64)
+        chk_lo, chk_hi = max(-2.0, -3.0 * span), min(2.0, 3.0 * span)
+        chk_grid = torch.linspace(chk_lo, chk_hi, 300, dtype=torch.float64)
+        sl = SVISlice.from_backbone(model, float(t), warm_grid)
+        sl.fit(kk, ivt, ww, steps=600, lr=0.02, g_grid=pen_grid)
+        with torch.no_grad():
+            wg = sl.total_variance(grid)
+        g = durrleman_g(chk_grid, sl.total_variance)
+        refined_w[float(t)] = wg
+        refined_status[float(t)] = "ok" if float(g.min()) >= -1e-9 else "butterfly_fail"
+        validated[float(t)] = (chk_lo, chk_hi)
+    # calendar check between accepted neighbours on the range where both were
+    # validated (far-wing extrapolations carry no quotes and are not claimed);
+    # on failure demote the later slice to the backbone
+    prev_w, prev_rng = None, None
+    gn = grid.numpy()
+    for t in expiries:
+        if refined_status[float(t)] != "ok":
+            with torch.no_grad():
+                refined_w[float(t)] = model.total_variance(grid, torch.full_like(grid, float(t)))
+        rng = validated[float(t)]
+        if prev_w is not None:
+            lo, hi = max(rng[0], prev_rng[0]), min(rng[1], prev_rng[1])
+            m = (gn >= lo) & (gn <= hi)
+            if m.any() and float((refined_w[float(t)][m] - prev_w[m]).min()) < -1e-12:
+                refined_status[float(t)] = "calendar_fail"
+                with torch.no_grad():
+                    refined_w[float(t)] = model.total_variance(grid, torch.full_like(grid, float(t)))
+        prev_w, prev_rng = refined_w[float(t)], rng
+    def _ref_iv(kv, t):
+        return np.sqrt(np.interp(kv, grid.numpy(), refined_w[float(t)].numpy()) / float(t))
+    q["ref_iv"] = np.concatenate([_ref_iv(q[q["T"] == t]["k"].values, t) for t in expiries]) if all((q["T"] == t).any() for t in expiries) else fitted
+    q = q.sort_values(["T", "strike"])  # concat above followed expiry order; realign
+    q["ref_iv"] = np.concatenate([_ref_iv(q[q["T"] == t]["k"].values, t) for t in expiries])
+    ref_err = (q["ref_iv"] - q["mid_iv"]) * 100
+    refined = {"rmse_vol_pts": float(np.sqrt((ref_err ** 2).mean())),
+               "inside_bid_ask_share": float(((q["ref_iv"] >= q["bid_iv"]) & (q["ref_iv"] <= q["ask_iv"])).mean()),
+               "slices_refined": int(sum(v == "ok" for v in refined_status.values())),
+               "slices_fallback": {f"{t*365:.1f}d": v for t, v in refined_status.items() if v != "ok"},
+               "time_s": round(time.time() - t_r, 3),
+               "guarantee": "butterfly (Durrleman g>=0) and calendar checked on a dense grid within each slice's validated log-moneyness range (3x the quoted span, capped at |k|<=2); outside it, and wherever a check failed, the eSSVI backbone is used",
+               "validated_k_range": {f"{t*365:.1f}d": [round(a, 3), round(b, 3)] for t, (a, b) in validated.items()}}
+
     # -- venue marks: arbitrage beyond the spread ----------------------------
     bs = BlackScholes()
     venue = {"butterfly": [], "vertical": [], "calendar": []}
@@ -119,10 +175,13 @@ def fit_chain(df: pd.DataFrame, *, currency: str = "", device: str = "cpu", as_o
         for v in vertical_violations(s["strike"].values, mark_c, 1.0, tol):
             venue["vertical"].append({"T": float(t), **v})
         cal_slices.append((float(t), s["k"].values, (s["mark_iv"].values ** 2) * float(t)))
-        err = (s["fit_iv"] - s["mid_iv"]) * 100
+        err = (s["fit_iv"] - s["mid_iv"]) * 100; rerr = (s["ref_iv"] - s["mid_iv"]) * 100
         slices_out.append({"T": float(t), "forward": F, "n": int(len(s)),
                            "rmse_vol_pts": float(np.sqrt((err ** 2).mean())),
                            "inside_bid_ask": float(((s["fit_iv"] >= s["bid_iv"]) & (s["fit_iv"] <= s["ask_iv"])).mean()),
+                           "refined_rmse_vol_pts": float(np.sqrt((rerr ** 2).mean())),
+                           "refined_inside_bid_ask": float(((s["ref_iv"] >= s["bid_iv"]) & (s["ref_iv"] <= s["ask_iv"])).mean()),
+                           "refined_status": refined_status[float(t)], "ref_iv": s["ref_iv"].round(4).tolist(),
                            "k": s["k"].round(4).tolist(),
                            "strike": s["strike"].tolist(), "bid_iv": s["bid_iv"].round(4).tolist(),
                            "ask_iv": s["ask_iv"].round(4).tolist(), "mark_iv": s["mark_iv"].round(4).tolist(),
@@ -158,7 +217,7 @@ def fit_chain(df: pd.DataFrame, *, currency: str = "", device: str = "cpu", as_o
 
     return FitReport(
         currency=currency, as_of=as_of, n_quotes=int(len(df)), n_two_sided=int(df["two_sided"].sum()),
-        n_fit=int(len(q)), expiries=int(len(expiries)), fit=fit, inside_bid_ask_share=inside,
+        n_fit=int(len(q)), expiries=int(len(expiries)), fit=fit, inside_bid_ask_share=inside, refined=refined,
         venue_violations={k: v for k, v in venue.items()},
         our_violations=ours, greeks_max_abs_err=greeks,
         timings_s={"fit": round(t_fit, 3), "total": round(time.time() - t0, 3)}, device=device,

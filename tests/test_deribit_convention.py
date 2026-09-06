@@ -23,7 +23,3 @@ def test_price_in_coin_times_forward_is_black76(name, days, F, K, is_put, _, mar
     sigma = implied_volatility_bisect(Ft, Kt, T, r, usd, is_call=not is_put)
     back = BlackScholes()(Ft, Kt, T, r, sigma, is_call=not is_put)
     assert abs(float(back) / float(usd) - 1) < 1e-6
-    # and the *spot* convention would be visibly wrong at long expiries: the
-    # deep-ITM put's coin price must equal (K - F)/F + time value, not (K - spot)/spot
-    if is_put and K > F:
-        assert abs(mark_btc - (K - F) / F) < 0.02

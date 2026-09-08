@@ -7,6 +7,7 @@ append-only.
 
 from __future__ import annotations
 
+import gzip
 import html
 import io
 import json
@@ -25,6 +26,7 @@ from voltorch.deribit import fetch_chain
 
 DOCS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "docs")
 HIST = os.path.join(DOCS, "history.jsonl")
+ARCHIVE = os.path.join(DOCS, "archive")
 MIN_TWO_SIDED = 300
 CSS = """body{font:15px/1.5 -apple-system,system-ui,sans-serif;max-width:1180px;margin:0 auto;padding:24px 16px;color:#111;background:#fff}
 h1{font-size:24px;margin:0 0 4px}h2{font-size:18px;margin:28px 0 8px}h3{font-size:15px;margin:18px 0 4px}
@@ -70,6 +72,42 @@ def section(r) -> str:
 <div class='grid'>{''.join(smile_svg(s) for s in r.slices)}</div>"""
 
 
+def archive(r, now: datetime) -> str:
+    """Write the whole fitted surface and the quotes it was fitted to.
+
+    ``history.jsonl`` keeps fit diagnostics — rmse, counts, violations — which
+    say how good a fit was but do not contain the surface. A diagnostic cannot
+    be refitted, resampled or backtested; the quotes can. This is the only part
+    of the run that is unrecoverable once the book moves, so it is written
+    first and separately, one immutable file per run rather than an appended
+    file, so that nothing already recorded is ever rewritten.
+
+    Roughly 10 KB gzipped per currency per run (~1 MB/day for both chains).
+    """
+    path = os.path.join(ARCHIVE, f"{now:%Y/%m/%d}")
+    os.makedirs(path, exist_ok=True)
+    name = os.path.join(path, f"{now:%H%M}Z-{r.currency}.json.gz")
+    payload = {
+        "as_of": r.as_of,
+        "currency": r.currency,
+        "voltorch_version": __version__,
+        "n_quotes": r.n_quotes,
+        "n_two_sided": r.n_two_sided,
+        "n_fit": r.n_fit,
+        "fit": r.fit,
+        "refined": r.refined,
+        "venue_violations": r.venue_violations,
+        "our_violations": r.our_violations,
+        "greeks_max_abs_err": r.greeks_max_abs_err,
+        # the irreplaceable part: per-expiry forwards, the two-sided book in
+        # vol space, and both fitted curves evaluated on the same grid
+        "slices": [{k: (v.tolist() if hasattr(v, "tolist") else v) for k, v in s_.items()} for s_ in r.slices],
+    }
+    with gzip.open(name, "wt", encoding="utf-8") as fh:
+        json.dump(payload, fh, separators=(",", ":"))
+    return name
+
+
 def main() -> int:
     now = datetime.now(timezone.utc)
     reports = []
@@ -82,6 +120,8 @@ def main() -> int:
         reports.append(r)
         print(f"{cur}: quotes={r.n_quotes} refined rmse={r.refined['rmse_vol_pts']:.2f} inside={r.refined['inside_bid_ask_share']:.0%} executable={sum(len(x) for x in r.venue_violations['executable'].values())}")
     os.makedirs(DOCS, exist_ok=True)
+    for r in reports:
+        print(f"archived {archive(r, now)}")
     with open(HIST, "a", encoding="utf-8") as fh:
         for r in reports:
             ex = r.venue_violations["executable"]

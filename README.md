@@ -35,6 +35,11 @@ Live, refit every 30 minutes: **https://savabs.github.io/voltorch/**
   surface is arbitrage-free *by construction* at every optimiser step.
 * `SVISlice` — per-expiry raw SVI refinement, arbitrage-*checked* on a dense grid
   (Durrleman g ≥ 0, calendar against neighbours) with fallback to the backbone.
+  Calendar is checked, and therefore claimed, only where **both** expiries have
+  quotes; beyond the quoted range the surface is extrapolation and is labelled
+  as such. `report.refined` carries `quoted_k_range` and
+  `calendar_checked_k_range` so the reader can see exactly where the claim
+  applies.
 * `arbitrage` — `durrleman_g`, `butterfly_violations`, `vertical_violations`,
   `calendar_violations`, and `executable_violations` (against bids and asks).
 * `implied_volatility_bisect` — bracketed bisection for market quotes; it cannot
@@ -175,6 +180,48 @@ pip install voltorch[dev] && pytest
   characteristic function, so it does not price through `FourierCOS`.
 - Not a risk system. There is no calendar, no day count convention, no
   settlement, no market data. It prices and it differentiates.
+- The no-arbitrage claim on a refined slice covers the quoted range, not the
+  wings. Butterfly is checked out to three times the quoted span; calendar only
+  where both neighbouring expiries are quoted. Outside that, the SVI wing is an
+  extrapolation and nothing is asserted about it. Until 0.2.1 the calendar check
+  ran on the wings too, which rejected good slices for crossings at strikes
+  nobody quotes — see the changelog.
+
+## Changelog
+
+### 0.2.1
+
+The calendar check now runs on the range where both expiries are quoted, instead
+of on three times the quoted span capped at |k| ≤ 2 — which reached a strike at
+13% of the forward, where nothing trades.
+
+Measured over eight BTC chains taken ninety seconds apart, the old range rejected
+23 refined slices and **not one of them failed the same check where quotes
+exist**: the worst dips sat at k = 0.55, −1.26 and −2.00, while inside the quoted
+region the slices were ordered correctly by ten to a hundred times the bid-ask
+spread expressed in total variance. Two extrapolations crossing in an unquoted
+wing is not calendar arbitrage.
+
+On one archived chain, refit from the identical bytes:
+
+| | 0.2.0 | 0.2.1 |
+|---|---|---|
+| refined RMSE, vol pts | 1.044 | 0.690 |
+| inside the bid-ask | 83.6% | 91.8% |
+| slices demoted to the backbone | 3 of 10 | 0 of 10 |
+
+Across the eight-chain sample the mean error falls from 0.749 to 0.700 and its
+run-to-run spread halves, from 0.260 to 0.132.
+
+The claim narrows with the check: calendar consistency is asserted where both
+expiries are quoted and nowhere else. `report.refined` gains `quoted_k_range` and
+`calendar_checked_k_range`, and a pair whose quoted ranges do not overlap is
+reported as `calendar_unverifiable` and demoted, because an unverified slice
+should not be published. Butterfly is unchanged.
+
+The regression is pinned by `tests/test_chain_calendar.py` against a real chain
+committed with it, which asserts both halves of the finding: that the wings do
+cross on that chain, and that the quoted region does not.
 
 ## Licence
 

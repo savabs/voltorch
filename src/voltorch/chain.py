@@ -103,6 +103,7 @@ def fit_chain(df: pd.DataFrame, *, currency: str = "", device: str = "cpu", as_o
     # -- refinement: per-slice SVI, arbitrage-CHECKED, backbone fallback ------
     grid = torch.linspace(-2.0, 2.0, 400, dtype=torch.float64)
     refined_w, refined_status, validated = {}, {}, {}
+    quoted, refined_slice = {}, {}
     t_r = time.time()
     for t in expiries:
         s = q[q["T"] == t]
@@ -126,26 +127,65 @@ def fit_chain(df: pd.DataFrame, *, currency: str = "", device: str = "cpu", as_o
             wg = sl.total_variance(grid)
         g = durrleman_g(chk_grid, sl.total_variance)
         refined_w[float(t)] = wg
+        refined_slice[float(t)] = sl
         refined_status[float(t)] = "ok" if float(g.min()) >= -1e-9 else "butterfly_fail"
         validated[float(t)] = (chk_lo, chk_hi)
-    # calendar check between accepted neighbours on the range where both were
-    # validated (far-wing extrapolations carry no quotes and are not claimed);
-    # on failure demote the later slice to the backbone
-    prev_w, prev_rng = None, None
-    gn = grid.numpy()
+        quoted[float(t)] = (float(s["k"].min()), float(s["k"].max()))
+    # Calendar check between accepted neighbours, on the range where BOTH slices
+    # have quotes -- not on their extrapolated wings.
+    #
+    # Until 0.2.1 this compared the overlap of the two validated ranges, which
+    # run to three times the quoted span: for a chain quoted out to k = 0.4 the
+    # comparison reached k = 2, a strike at 13% of the forward. Measured over
+    # eight BTC chains, that rejected 23 slices and not one of them failed the
+    # same check where quotes exist; the worst dips sat at k = 0.55, -1.26 and
+    # -2.00 while inside the quoted region the slices were ordered correctly by
+    # ten to a hundred times the spread. Two extrapolations crossing in a wing
+    # nobody quotes is not calendar arbitrage, and demoting a good slice for it
+    # cost about 0.05 vol points of accuracy and doubled the run-to-run spread.
+    #
+    # So the claim narrows to match the data: calendar consistency is checked,
+    # and therefore claimed, where both expiries are quoted. Beyond that the
+    # surface is extrapolation and is labelled as such. A pair whose quoted
+    # ranges do not overlap cannot be checked at all, and an unverified slice is
+    # demoted rather than published -- the point is to claim only what was
+    # tested.
+    def _backbone_w(tf: float, kv: torch.Tensor) -> torch.Tensor:
+        with torch.no_grad():
+            return model.total_variance(kv, torch.full_like(kv, tf))
+
+    accepted: dict = {}
+    calendar_ranges: dict = {}
+    prev_t = None
     for t in expiries:
-        if refined_status[float(t)] != "ok":
-            with torch.no_grad():
-                refined_w[float(t)] = model.total_variance(grid, torch.full_like(grid, float(t)))
-        rng = validated[float(t)]
-        if prev_w is not None:
-            lo, hi = max(rng[0], prev_rng[0]), min(rng[1], prev_rng[1])
-            m = (gn >= lo) & (gn <= hi)
-            if m.any() and float((refined_w[float(t)][m] - prev_w[m]).min()) < -1e-12:
-                refined_status[float(t)] = "calendar_fail"
+        tf = float(t)
+        if refined_status[tf] != "ok":
+            refined_w[tf] = _backbone_w(tf, grid)
+            accepted[tf] = lambda kv, tf=tf: _backbone_w(tf, kv)
+        else:
+            accepted[tf] = refined_slice[tf].total_variance
+        if prev_t is not None:
+            lo = max(quoted[tf][0], quoted[prev_t][0])
+            hi = min(quoted[tf][1], quoted[prev_t][1])
+            if hi <= lo:
+                calendar_ranges[tf] = None
+                if refined_status[tf] == "ok":
+                    refined_status[tf] = "calendar_unverifiable"
+                    refined_w[tf] = _backbone_w(tf, grid)
+                    accepted[tf] = lambda kv, tf=tf: _backbone_w(tf, kv)
+            else:
+                # A dense grid over the overlap, rather than whatever the global
+                # 400-point grid happens to land on: a two-day pair overlaps in
+                # 0.2 of log-moneyness, which the global grid samples 20 times.
+                kk = torch.linspace(lo, hi, 300, dtype=torch.float64)
                 with torch.no_grad():
-                    refined_w[float(t)] = model.total_variance(grid, torch.full_like(grid, float(t)))
-        prev_w, prev_rng = refined_w[float(t)], rng
+                    dw = accepted[tf](kk) - accepted[prev_t](kk)
+                calendar_ranges[tf] = (lo, hi)
+                if refined_status[tf] == "ok" and float(dw.min()) < -1e-12:
+                    refined_status[tf] = "calendar_fail"
+                    refined_w[tf] = _backbone_w(tf, grid)
+                    accepted[tf] = lambda kv, tf=tf: _backbone_w(tf, kv)
+        prev_t = tf
     def _ref_iv(kv, t):
         return np.sqrt(np.interp(kv, grid.numpy(), refined_w[float(t)].numpy()) / float(t))
     q["ref_iv"] = np.concatenate([_ref_iv(q[q["T"] == t]["k"].values, t) for t in expiries]) if all((q["T"] == t).any() for t in expiries) else fitted
@@ -157,8 +197,11 @@ def fit_chain(df: pd.DataFrame, *, currency: str = "", device: str = "cpu", as_o
                "slices_refined": int(sum(v == "ok" for v in refined_status.values())),
                "slices_fallback": {f"{t*365:.1f}d": v for t, v in refined_status.items() if v != "ok"},
                "time_s": round(time.time() - t_r, 3),
-               "guarantee": "butterfly (Durrleman g>=0) and calendar checked on a dense grid within each slice's validated log-moneyness range (3x the quoted span, capped at |k|<=2); outside it, and wherever a check failed, the eSSVI backbone is used",
-               "validated_k_range": {f"{t*365:.1f}d": [round(a, 3), round(b, 3)] for t, (a, b) in validated.items()}}
+               "guarantee": "butterfly (Durrleman g>=0) checked on a dense grid within each slice's validated log-moneyness range (3x the quoted span, capped at |k|<=2); calendar checked against the previous expiry on the range where BOTH are quoted, and claimed only there -- beyond the quoted range the surface is extrapolation; wherever a check failed or could not be run, the eSSVI backbone is used",
+               "validated_k_range": {f"{t*365:.1f}d": [round(a, 3), round(b, 3)] for t, (a, b) in validated.items()},
+               "quoted_k_range": {f"{t*365:.1f}d": [round(a, 3), round(b, 3)] for t, (a, b) in quoted.items()},
+               "calendar_checked_k_range": {f"{t*365:.1f}d": (None if r is None else [round(r[0], 3), round(r[1], 3)])
+                                            for t, r in calendar_ranges.items()}}
 
     # -- venue marks: arbitrage beyond the spread ----------------------------
     bs = BlackScholes()

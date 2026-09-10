@@ -35,7 +35,7 @@ from .ssvi import SSVI
 from .chain import FitReport, fit_chain, otm
 from .arbitrage import butterfly_violations, calendar_violations, durrleman_g, vertical_violations
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 __all__ = [
     "implied_volatility_bisect", "SSVI", "fit_chain", "FitReport", "otm", "butterfly_violations", "calendar_violations", "durrleman_g", "vertical_violations",
